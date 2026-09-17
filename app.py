@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import re
-import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import BOTH, LEFT, RIGHT, W, X, Y
 
 try:
     import pymupdf
 except ImportError:  # pragma: no cover
     pymupdf = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # pragma: no cover
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 
 GROUP_RE = re.compile(r"^[A-ZĂÂÎȘȚ]{2,4}-?\d{3}$", re.IGNORECASE)
@@ -25,6 +34,9 @@ WEEK_EVEN = "Par\u0103"
 ROOM_ONLY_RE = re.compile(
     r"^(?:(?:Aula|sala|lab\.)\s*)?(?:\d{1,3}(?:-\d{1,3})?|[A-Z]-?\d{1,3})$",
     re.IGNORECASE,
+)
+TEACHER_RE = re.compile(
+    r"^[A-ZĂÂÎȘȚ][A-Za-zĂÂÎȘȚăâîșț\-']+(?:\s+[A-ZĂÂÎȘȚ]\.)+$",
 )
 
 
@@ -404,248 +416,600 @@ def parse_pdf(path: str | Path) -> list[ScheduleEntry]:
     return _merge_room_fragments(entries)
 
 
-class ScheduleApp(tk.Tk):
+COLOR_COURSE = (157, 195, 230)  # blue
+COLOR_SEMINAR = (169, 208, 142)  # green
+COLOR_LAB = (244, 177, 131)  # orange/red
+COLOR_EMPTY = (217, 217, 217)  # grey
+COLOR_HEADER = (255, 255, 255)
+COLOR_BORDER = (0, 0, 0)
+COLOR_TEXT = (0, 0, 0)
+
+DAY_HEADERS = ["LUNI", "MARȚI", "MIERCURI", "JOI", "VINERI"]
+LIGHT_THEME = "cosmo"
+DARK_THEME = "darkly"
+
+
+@dataclass(frozen=True)
+class ParsedActivity:
+    subject: str
+    teacher: str
+    room: str
+    kind: str  # course | seminar | lab | empty
+
+
+def _activity_kind(subject: str) -> str:
+    lowered = subject.lower().strip()
+    if lowered.startswith("c.") or lowered.startswith("curs"):
+        return "course"
+    if lowered.startswith("lab"):
+        return "lab"
+    return "seminar"
+
+
+def _shorten_room(room: str) -> str:
+    room = room.strip()
+    if not room:
+        return ""
+    # Keep the useful room token, drop long venue suffixes.
+    if room.lower().startswith("aula"):
+        parts = room.split()
+        return " ".join(parts[:2]) if len(parts) >= 2 else room
+    tokens = room.split()
+    if len(tokens) >= 2 and re.fullmatch(r"[\dA-Za-z-]+", tokens[0]):
+        return tokens[0]
+    return room
+
+
+def _looks_like_teacher(text: str) -> bool:
+    return bool(TEACHER_RE.fullmatch(text.strip()))
+
+
+def _looks_like_room(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    if ROOM_ONLY_RE.fullmatch(text):
+        return True
+    if re.match(r"^(?:Aula|sala)\b", text, re.IGNORECASE):
+        return True
+    # e.g. "3-3 Amdaris", "115 / 630"
+    if re.match(r"^\d{1,3}(?:-\d{1,3})?(?:\s|/)", text):
+        return True
+    return False
+
+
+def _join_subject_parts(parts: list[str]) -> str:
+    subject = " ".join(part.strip() for part in parts if part.strip())
+    subject = re.sub(r"\s*/\s*", "/", subject)
+    subject = re.sub(r"\(\s+", "(", subject)
+    subject = re.sub(r"\s+\)", ")", subject)
+    subject = re.sub(r"\s+", " ", subject).strip()
+    # Prefer a readable space after slash inside month ranges.
+    subject = re.sub(
+        r"/(?=(?:ianuarie|februarie|martie|aprilie|mai|iunie|iulie|august|"
+        r"septembrie|octombrie|octombire|noiembrie|decembrie))",
+        "/ ",
+        subject,
+        flags=re.IGNORECASE,
+    )
+    return subject
+
+
+def _split_activity_parts(content: str) -> tuple[str, str, str]:
+    """Map visual PDF lines to subject / teacher / room without breaking normal cells."""
+    parts = [part.strip() for part in content.split("|") if part.strip()]
+    if not parts:
+        return "", "", ""
+    if len(parts) == 1:
+        return parts[0], "", ""
+
+    room = ""
+    teachers: list[str] = []
+    index = len(parts) - 1
+    if index >= 0 and _looks_like_room(parts[index]):
+        room = parts[index]
+        index -= 1
+    while index >= 0 and _looks_like_teacher(parts[index]):
+        teachers.insert(0, parts[index])
+        index -= 1
+    subject_parts = parts[: index + 1]
+
+    # Classic 3-line cell already split correctly.
+    if len(parts) == 3 and teachers and room and len(subject_parts) == 1:
+        return subject_parts[0], teachers[0], room
+
+    # Wrapped subject lines: keep merging leftover non-teacher/non-room fragments.
+    if not teachers and len(parts) >= 3:
+        # Fallback for unusual teacher formats: last non-room token is teacher.
+        if room and index >= 0:
+            teachers = [parts[index]]
+            subject_parts = parts[:index]
+        elif not room and index >= 0:
+            teachers = [parts[index]]
+            subject_parts = parts[:index]
+
+    subject = _join_subject_parts(subject_parts) if subject_parts else parts[0]
+    teacher = " / ".join(teachers)
+    return subject, teacher, room
+
+
+def parse_activity(content: str) -> ParsedActivity:
+    """Split cell text into subject, teacher and room, repairing wrapped subject lines."""
+    subject, teacher, room = _split_activity_parts(content)
+    room = _shorten_room(room)
+    if not subject or subject == "-":
+        return ParsedActivity("-", "", "", "empty")
+    return ParsedActivity(subject, teacher, room, _activity_kind(subject))
+
+
+def _color_for_kind(kind: str) -> tuple[int, int, int]:
+    if kind == "course":
+        return COLOR_COURSE
+    if kind == "lab":
+        return COLOR_LAB
+    if kind == "empty":
+        return COLOR_EMPTY
+    return COLOR_SEMINAR
+
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = [
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _display_interval(interval: str) -> str:
+    return interval.replace(":", ".")
+
+
+def _activity_lines(activity: ParsedActivity) -> list[str]:
+    if activity.kind == "empty":
+        return ["-"]
+    lines = [activity.subject]
+    if activity.teacher:
+        lines.append(activity.teacher)
+    if activity.room:
+        lines.append(activity.room)
+    return lines
+
+
+def _fit_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> str:
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    ellipsis = "…"
+    trimmed = text
+    while trimmed and draw.textlength(trimmed + ellipsis, font=font) > max_width:
+        trimmed = trimmed[:-1]
+    return (trimmed + ellipsis) if trimmed else ellipsis
+
+
+def _wrap_line(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_lines: int = 2,
+) -> list[str]:
+    if draw.textlength(text, font=font) <= max_width:
+        return [text]
+    words = text.split()
+    if len(words) <= 1:
+        return [_fit_text(draw, text, font, max_width)]
+    lines: list[str] = []
+    index = 0
+    while index < len(words) and len(lines) < max_lines:
+        current = words[index]
+        index += 1
+        while index < len(words):
+            candidate = f"{current} {words[index]}"
+            if draw.textlength(candidate, font=font) <= max_width:
+                current = candidate
+                index += 1
+            else:
+                break
+        if len(lines) == max_lines - 1 and index < len(words):
+            leftover = " ".join([current, *words[index:]])
+            lines.append(_fit_text(draw, leftover, font, max_width))
+            break
+        lines.append(current)
+    return lines
+
+
+def _draw_wrapped_block(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    lines: list[str],
+    fill: tuple[int, int, int],
+    font: ImageFont.ImageFont,
+    bold_font: ImageFont.ImageFont,
+) -> None:
+    left, top, right, bottom = box
+    draw.rectangle(box, fill=fill, outline=COLOR_BORDER, width=2)
+    usable_width = right - left - 12
+    usable_height = bottom - top - 8
+    rendered: list[tuple[str, ImageFont.ImageFont]] = []
+    for index, line in enumerate(lines):
+        use_font = bold_font if index == 0 else font
+        wrapped = _wrap_line(draw, line, use_font, usable_width, max_lines=2 if index == 0 else 1)
+        for part in wrapped:
+            rendered.append((part, use_font))
+    line_height = max(font.size, bold_font.size) + 2
+    total_height = line_height * len(rendered)
+    while total_height > usable_height and len(rendered) > 1:
+        rendered.pop()
+        total_height = line_height * len(rendered)
+    y = top + max(4, (usable_height - total_height) // 2)
+    for text, use_font in rendered:
+        width = draw.textlength(text, font=use_font)
+        x = left + (right - left - width) / 2
+        draw.text((x, y), text, fill=COLOR_TEXT, font=use_font)
+        y += line_height
+
+
+def _slot_entries(
+    entries: list[ScheduleEntry],
+    group: str,
+    week_filter: str = WEEK_ALL,
+) -> dict[tuple[str, str], list[ScheduleEntry]]:
+    slots: dict[tuple[str, str], list[ScheduleEntry]] = {}
+    for entry in entries:
+        if entry.group != group:
+            continue
+        if week_filter != WEEK_ALL and entry.week not in (week_filter, WEEK_ALL):
+            continue
+        key = (entry.day, entry.interval)
+        bucket = slots.setdefault(key, [])
+        if (entry.week, entry.content) not in {(item.week, item.content) for item in bucket}:
+            bucket.append(entry)
+    for bucket in slots.values():
+        bucket.sort(key=lambda item: (item.week, item.content))
+    return slots
+
+
+def _same_activity(left: ScheduleEntry, right: ScheduleEntry) -> bool:
+    return (
+        left.week == right.week
+        and parse_activity(left.content).subject == parse_activity(right.content).subject
+        and parse_activity(left.content).teacher == parse_activity(right.content).teacher
+        and parse_activity(left.content).room == parse_activity(right.content).room
+    )
+
+
+def _merge_span(
+    slots: dict[tuple[str, str], list[ScheduleEntry]],
+    day: str,
+    start_index: int,
+) -> int:
+    """Return how many consecutive TIME_ROWS share one full-week activity."""
+    start_interval = TIME_ROWS[start_index]
+    current = slots.get((day, start_interval), [])
+    if len(current) != 1 or current[0].week != WEEK_ALL:
+        return 1
+    span = 1
+    while start_index + span < len(TIME_ROWS):
+        nxt = slots.get((day, TIME_ROWS[start_index + span]), [])
+        if len(nxt) != 1 or not _same_activity(current[0], nxt[0]):
+            break
+        span += 1
+    return span
+
+
+def render_schedule_image(
+    entries: list[ScheduleEntry],
+    group: str,
+    week_filter: str = WEEK_ALL,
+) -> Image.Image:
+    """Draw a colour-coded weekly timetable image for one group."""
+    if Image is None or ImageDraw is None or ImageFont is None:
+        raise RuntimeError("Lipsește Pillow. Rulează: pip install Pillow")
+
+    slots = _slot_entries(entries, group, week_filter)
+    if not any(slots.values()):
+        raise ValueError(f"Nu există activități pentru grupa {group}.")
+
+    time_col = 130
+    day_col = 210
+    header_h = 48
+    row_h = 110
+    margin = 16
+    width = margin * 2 + time_col + day_col * len(DAY_NAMES)
+    height = margin * 2 + header_h + row_h * len(TIME_ROWS)
+
+    image = Image.new("RGB", (width, height), COLOR_HEADER)
+    draw = ImageDraw.Draw(image)
+    title_font = _load_font(16, bold=True)
+    cell_font = _load_font(13)
+    cell_bold = _load_font(14, bold=True)
+    small_font = _load_font(11)
+
+    origin_x = margin
+    origin_y = margin
+
+    # Header cells
+    headers = ["ORA/ZIUA", *DAY_HEADERS]
+    widths = [time_col, *[day_col] * len(DAY_NAMES)]
+    x = origin_x
+    for label, cell_width in zip(headers, widths):
+        box = (x, origin_y, x + cell_width, origin_y + header_h)
+        draw.rectangle(box, fill=COLOR_HEADER, outline=COLOR_BORDER, width=2)
+        text = _fit_text(draw, label, title_font, cell_width - 10)
+        tw = draw.textlength(text, font=title_font)
+        draw.text(
+            (x + (cell_width - tw) / 2, origin_y + (header_h - title_font.size) / 2 - 2),
+            text,
+            fill=COLOR_TEXT,
+            font=title_font,
+        )
+        x += cell_width
+
+    occupied: set[tuple[str, int]] = set()
+    for row_index, interval in enumerate(TIME_ROWS):
+        y = origin_y + header_h + row_index * row_h
+        time_box = (origin_x, y, origin_x + time_col, y + row_h)
+        draw.rectangle(time_box, fill=COLOR_HEADER, outline=COLOR_BORDER, width=2)
+        label = _display_interval(interval)
+        tw = draw.textlength(label, font=title_font)
+        draw.text(
+            (origin_x + (time_col - tw) / 2, y + (row_h - title_font.size) / 2 - 2),
+            label,
+            fill=COLOR_TEXT,
+            font=title_font,
+        )
+
+        for day_index, day in enumerate(DAY_NAMES):
+            if (day, row_index) in occupied:
+                continue
+            x = origin_x + time_col + day_index * day_col
+            span = _merge_span(slots, day, row_index)
+            for offset in range(1, span):
+                occupied.add((day, row_index + offset))
+            box = (x, y, x + day_col, y + row_h * span)
+            cell_entries = slots.get((day, interval), [])
+
+            if not cell_entries:
+                _draw_wrapped_block(
+                    draw, box, ["-"], COLOR_EMPTY, cell_font, cell_bold,
+                )
+                continue
+
+            if len(cell_entries) == 1 and (
+                cell_entries[0].week == WEEK_ALL or week_filter != WEEK_ALL
+            ):
+                activity = parse_activity(cell_entries[0].content)
+                _draw_wrapped_block(
+                    draw,
+                    box,
+                    _activity_lines(activity),
+                    _color_for_kind(activity.kind),
+                    cell_font,
+                    cell_bold,
+                )
+                continue
+
+            # Split cell for odd/even week alternatives.
+            odd = next((item for item in cell_entries if item.week == WEEK_ODD), None)
+            even = next((item for item in cell_entries if item.week == WEEK_EVEN), None)
+            all_week = next((item for item in cell_entries if item.week == WEEK_ALL), None)
+            if odd or even:
+                bands = [odd or all_week, even if even is not None else None]
+                if even and not odd and not all_week:
+                    bands = [None, even]
+                elif odd and not even and not all_week:
+                    bands = [odd, None]
+            else:
+                bands = list(cell_entries)
+
+            band_count = max(len(bands), 1)
+            band_h = (row_h * span) / band_count
+            for band_index, entry in enumerate(bands):
+                band_top = int(y + band_index * band_h)
+                band_bottom = int(y + (band_index + 1) * band_h)
+                band_box = (x, band_top, x + day_col, band_bottom)
+                if entry is None:
+                    _draw_wrapped_block(
+                        draw, band_box, ["-"], COLOR_EMPTY, small_font, cell_bold,
+                    )
+                    continue
+                activity = parse_activity(entry.content)
+                _draw_wrapped_block(
+                    draw,
+                    band_box,
+                    _activity_lines(activity),
+                    _color_for_kind(activity.kind),
+                    small_font if band_count > 1 else cell_font,
+                    cell_bold,
+                )
+
+    # Outer border reinforcement
+    draw.rectangle(
+        (origin_x, origin_y, origin_x + time_col + day_col * len(DAY_NAMES), origin_y + header_h + row_h * len(TIME_ROWS)),
+        outline=COLOR_BORDER,
+        width=3,
+    )
+    return image
+
+
+def save_schedule_image(
+    entries: list[ScheduleEntry],
+    group: str,
+    path: str | Path,
+    week_filter: str = WEEK_ALL,
+) -> Path:
+    destination = Path(path)
+    image = render_schedule_image(entries, group, week_filter)
+    image.save(destination)
+    return destination
+
+
+class ScheduleApp(ttk.Window):
     def __init__(self) -> None:
-        super().__init__()
-        self.title("Orar pe grupe")
+        super().__init__(themename=LIGHT_THEME, title="Orar pe grupe")
         self.geometry("1150x700")
         self.minsize(850, 500)
         self.entries: list[ScheduleEntry] = []
+        self.dark_mode_var = ttk.BooleanVar(value=False)
         self._build_ui()
 
-    def _build_ui(self) -> None:
-        self.configure(bg="#f4f7fb")
-        self.option_add("*Font", ("Segoe UI", 10))
-        self.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
-        self.option_add("*TCombobox*Listbox.background", "#ffffff")
-        self.option_add("*TCombobox*Listbox.foreground", "#344054")
-        self.option_add("*TCombobox*Listbox.selectBackground", "#dbe7ff")
-        self.option_add("*TCombobox*Listbox.selectForeground", "#172033")
-        self.option_add("*TCombobox*Listbox.borderWidth", 0)
-        self.option_add("*TCombobox*Listbox.relief", "flat")
-
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("App.TFrame", background="#f4f7fb")
-        style.configure("Card.TFrame", background="#ffffff")
-        style.configure(
+    def _configure_fonts(self) -> None:
+        colors = self.style.colors
+        text_color = "#ffffff" if self.dark_mode_var.get() else "#000000"
+        self.style.configure(
             "Title.TLabel",
-            background="#ffffff",
-            foreground="#172033",
             font=("Segoe UI", 22, "bold"),
+            foreground=text_color,
         )
-        style.configure(
-            "Subtitle.TLabel",
-            background="#ffffff",
-            foreground="#667085",
+        self.style.configure(
+            "Body.TLabel",
+            foreground=text_color,
             font=("Segoe UI", 10),
         )
-        style.configure(
+        self.style.configure(
             "Field.TLabel",
-            background="#ffffff",
-            foreground="#344054",
+            foreground=text_color,
             font=("Segoe UI", 9, "bold"),
         )
-        style.configure(
-            "Muted.TLabel",
-            background="#ffffff",
-            foreground="#667085",
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Status.TLabel",
-            background="#f4f7fb",
-            foreground="#667085",
-            font=("Segoe UI", 9),
-        )
-        style.configure(
-            "Accent.TButton",
-            background="#3867d6",
-            foreground="#ffffff",
-            borderwidth=0,
-            focusthickness=0,
-            padding=(16, 9),
-            font=("Segoe UI", 10, "bold"),
-        )
-        style.map(
-            "Accent.TButton",
-            background=[("active", "#2f56b8"), ("pressed", "#25479a")],
-            foreground=[("disabled", "#d0d5dd")],
-        )
-        style.configure(
-            "Modern.TCombobox",
-            fieldbackground="#ffffff",
-            background="#ffffff",
-            foreground="#172033",
-            bordercolor="#cbd5e1",
-            lightcolor="#cbd5e1",
-            darkcolor="#cbd5e1",
-            padding=(10, 7),
-            arrowsize=16,
-        )
-        style.map(
-            "Modern.TCombobox",
-            fieldbackground=[
-                ("readonly", "#ffffff"),
-                ("focus", "#f8fbff"),
-            ],
-            bordercolor=[("focus", "#3867d6")],
-            lightcolor=[("focus", "#3867d6")],
-            darkcolor=[("focus", "#3867d6")],
-            selectbackground=[("readonly", "#ffffff")],
-            selectforeground=[("readonly", "#172033")],
-        )
-        style.configure(
-            "Modern.Treeview",
-            background="#ffffff",
-            fieldbackground="#ffffff",
-            foreground="#344054",
-            rowheight=44,
-            borderwidth=0,
-            font=("Segoe UI", 10),
-        )
-        style.configure(
-            "Modern.Treeview.Heading",
-            background="#3867d6",
-            foreground="#ffffff",
-            relief="flat",
-            borderwidth=0,
-            padding=(12, 11),
-            font=("Segoe UI", 9, "bold"),
-        )
-        style.configure(
-            "Day.Treeview",
-            background="#e8efff",
-            foreground="#25479a",
-            font=("Segoe UI", 10, "bold"),
-        )
-        style.map(
-            "Modern.Treeview",
-            background=[("selected", "#dbe7ff")],
-            foreground=[("selected", "#172033")],
-            fieldbackground=[("selected", "#dbe7ff")],
-        )
-        style.configure(
-            "Modern.Vertical.TScrollbar",
-            background="#94a3b8",
-            troughcolor="#e8edf5",
-            bordercolor="#e8edf5",
-            lightcolor="#e8edf5",
-            darkcolor="#e8edf5",
-            borderwidth=0,
-            arrowsize=14,
-            width=12,
-        )
-        style.map(
-            "Modern.Vertical.TScrollbar",
-            background=[("active", "#64748b"), ("pressed", "#475569")],
+        self.style.configure("Treeview", rowheight=44, font=("Segoe UI", 10))
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        self.style.configure("Round.Toggle", foreground=text_color)
+        self.style.map(
+            "Round.Toggle",
+            foreground=[("selected", text_color), ("!selected", text_color)],
         )
 
-        header = ttk.Frame(self, style="App.TFrame", padding=(28, 24, 28, 16))
-        header.pack(fill="x")
-        card = ttk.Frame(header, style="Card.TFrame", padding=(24, 22, 24, 20))
-        card.pack(fill="x")
-        ttk.Label(card, text="Orar pe grupe", style="Title.TLabel").pack(anchor="w")
+    def _apply_row_colors(self) -> None:
+        colors = self.style.colors
+        odd_bg = colors.dark if self.dark_mode_var.get() else colors.light
+        self.table.tag_configure("even", background=colors.bg, foreground=colors.fg)
+        self.table.tag_configure("odd", background=odd_bg, foreground=colors.fg)
+        self.table.tag_configure("day", background=colors.primary, foreground="#ffffff")
+
+    def toggle_theme(self) -> None:
+        theme = DARK_THEME if self.dark_mode_var.get() else LIGHT_THEME
+        self.style.theme_use(theme)
+        self._configure_fonts()
+        self._apply_row_colors()
+
+    def _build_ui(self) -> None:
+        self._configure_fonts()
+
+        header = ttk.Frame(self, padding=(28, 24, 28, 16))
+        header.pack(fill=X)
+        card = ttk.Frame(header, padding=(24, 22, 24, 20))
+        card.pack(fill=X)
+        title_row = ttk.Frame(card)
+        title_row.pack(fill=X)
+        ttk.Label(title_row, text="Orar pe grupe", style="Title.TLabel").pack(side=LEFT, anchor=W)
+        ttk.Checkbutton(
+            title_row,
+            text="Dark mode",
+            variable=self.dark_mode_var,
+            command=self.toggle_theme,
+            bootstyle="round-toggle",
+        ).pack(side=RIGHT)
         ttk.Label(
             card,
             text="Deschide PDF-ul real și afișează activitățile organizate automat pe grupe.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(4, 18))
+            style="Body.TLabel",
+        ).pack(anchor=W, pady=(4, 18))
 
-        controls = ttk.Frame(card, style="Card.TFrame")
-        controls.pack(fill="x")
+        controls = ttk.Frame(card)
+        controls.pack(fill=X)
         ttk.Button(
-            controls, text="Deschide PDF", command=self.open_pdf, style="Accent.TButton",
-        ).pack(side="left")
+            controls, text="Deschide PDF", command=self.open_pdf, bootstyle="primary",
+        ).pack(side=LEFT)
+        ttk.Button(
+            controls, text="Salvează imagine", command=self.save_image, bootstyle="success",
+        ).pack(side=LEFT, padx=(10, 0))
         self.file_label = ttk.Label(
-            controls, text="Niciun fișier selectat", style="Muted.TLabel",
+            controls, text="Niciun fișier selectat", style="Body.TLabel",
         )
-        self.file_label.pack(side="left", padx=(14, 20))
+        self.file_label.pack(side=LEFT, padx=(14, 20))
 
-        ttk.Label(controls, text="GRUPĂ", style="Field.TLabel").pack(side="left", padx=(0, 6))
-        self.group_var = tk.StringVar(value="Toate")
+        ttk.Label(controls, text="GRUPĂ", style="Field.TLabel").pack(side=LEFT, padx=(0, 6))
+        self.group_var = ttk.StringVar(value="Toate")
         self.group_box = ttk.Combobox(
             controls, textvariable=self.group_var, state="readonly",
-            width=14, style="Modern.TCombobox", postcommand=self._style_dropdowns,
+            width=14, bootstyle="primary",
         )
         self.group_box["values"] = ("Toate",)
-        self.group_box.pack(side="left")
+        self.group_box.pack(side=LEFT)
         self.group_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
 
-        ttk.Label(controls, text="ZI", style="Field.TLabel").pack(side="left", padx=(18, 6))
-        self.day_var = tk.StringVar(value="Toate")
+        ttk.Label(controls, text="ZI", style="Field.TLabel").pack(side=LEFT, padx=(18, 6))
+        self.day_var = ttk.StringVar(value="Toate")
         self.day_box = ttk.Combobox(
             controls, textvariable=self.day_var, state="readonly",
-            width=12, style="Modern.TCombobox", postcommand=self._style_dropdowns,
+            width=12, bootstyle="primary",
         )
         self.day_box["values"] = ("Toate", *DAY_NAMES)
-        self.day_box.pack(side="left")
+        self.day_box.pack(side=LEFT)
         self.day_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
 
         ttk.Label(controls, text="SĂPTĂMÂNĂ", style="Field.TLabel").pack(
-            side="left", padx=(18, 6),
+            side=LEFT, padx=(18, 6),
         )
-        self.week_var = tk.StringVar(value=WEEK_ALL)
+        self.week_var = ttk.StringVar(value=WEEK_ALL)
         self.week_box = ttk.Combobox(
             controls, textvariable=self.week_var, state="readonly",
-            width=10, style="Modern.TCombobox", postcommand=self._style_dropdowns,
+            width=10, bootstyle="primary",
         )
         self.week_box["values"] = (WEEK_ALL, WEEK_ODD, WEEK_EVEN)
-        self.week_box.pack(side="left")
+        self.week_box.pack(side=LEFT)
         self.week_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
 
-        table_frame = ttk.Frame(self, style="App.TFrame", padding=(28, 0, 28, 12))
-        table_frame.pack(fill="both", expand=True)
-        columns = ("day", "time", "group", "week", "content")
+        table_frame = ttk.Frame(self, padding=(28, 0, 28, 12))
+        table_frame.pack(fill=BOTH, expand=True)
+        columns = ("day", "time", "group", "week", "subject", "teacher", "room")
         self.table = ttk.Treeview(
-            table_frame, columns=columns, show="headings", style="Modern.Treeview",
+            table_frame, columns=columns, show="headings", bootstyle="primary",
         )
-        self.table.tag_configure("even", background="#ffffff")
-        self.table.tag_configure("odd", background="#f8fafc")
-        self.table.tag_configure("day", background="#e8efff", foreground="#25479a")
+        self._apply_row_colors()
         headings = {
-            "day": "Zi / ziua săptămânii",
+            "day": "Zi",
             "time": "Interval",
             "group": "Grupă",
             "week": "Săptămână",
-            "content": "Activitate, sală și profesor",
+            "subject": "Obiect",
+            "teacher": "Profesor",
+            "room": "Sală",
         }
-        widths = {"day": 165, "time": 125, "group": 110, "week": 105, "content": 550}
+        widths = {
+            "day": 110,
+            "time": 120,
+            "group": 90,
+            "week": 100,
+            "subject": 280,
+            "teacher": 160,
+            "room": 140,
+        }
         for name in columns:
-            self.table.heading(name, text=headings[name])
-            self.table.column(name, width=widths[name], anchor="w")
+            self.table.heading(name, text=headings[name], anchor="center")
+            self.table.column(name, width=widths[name], anchor="center", stretch=True)
         scroll = ttk.Scrollbar(
             table_frame, orient="vertical", command=self.table.yview,
-            style="Modern.Vertical.TScrollbar",
+            bootstyle="round-primary",
         )
         self.table.configure(yscrollcommand=scroll.set)
-        self.table.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        self.table.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll.pack(side=RIGHT, fill=Y)
         self.status = ttk.Label(
             self, text="Selectează un PDF pentru a vedea orarul.",
-            style="Status.TLabel", padding=(28, 0, 28, 18),
+            style="Body.TLabel", padding=(28, 0, 28, 18),
         )
-        self.status.pack(anchor="w")
-
-    def _style_dropdowns(self) -> None:
-        """Keep the native combobox popup consistent with the application theme."""
-        for combo in (self.group_box, self.day_box, self.week_box):
-            popup = self.tk.call("ttk::combobox::PopdownWindow", str(combo))
-            listbox = f"{popup}.f.l"
-            try:
-                self.tk.call(
-                    listbox, "configure",
-                    "-background", "#ffffff",
-                    "-foreground", "#344054",
-                    "-selectbackground", "#dbe7ff",
-                    "-selectforeground", "#172033",
-                    "-font", "Segoe UI 10",
-                    "-borderwidth", 0,
-                    "-highlightthickness", 0,
-                    "-relief", "flat",
-                )
-            except tk.TclError:
-                continue
+        self.status.pack(anchor=W)
 
     def open_pdf(self) -> None:
         path = filedialog.askopenfilename(
@@ -666,6 +1030,38 @@ class ScheduleApp(tk.Tk):
         self.day_var.set("Toate")
         self.week_var.set("Toate")
         self.refresh()
+
+    def save_image(self) -> None:
+        if not self.entries:
+            messagebox.showinfo("Salvează imagine", "Deschide mai întâi un PDF cu orarul.")
+            return
+        group = self.group_var.get()
+        if group == "Toate":
+            messagebox.showinfo(
+                "Salvează imagine",
+                "Selectează o grupă anume pentru a genera orarul vizual.",
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            title="Salvează orarul ca imagine",
+            defaultextension=".png",
+            initialfile=f"orar_{group}.png",
+            filetypes=(("Imagine PNG", "*.png"), ("Toate fișierele", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            save_schedule_image(
+                self.entries,
+                group,
+                path,
+                week_filter=self.week_var.get(),
+            )
+        except (RuntimeError, ValueError, OSError) as error:
+            messagebox.showerror("Eroare la salvarea imaginii", str(error))
+            return
+        self.status.configure(text=f"Imaginea a fost salvată: {Path(path).name}")
+        messagebox.showinfo("Salvează imagine", f"Orarul pentru {group} a fost salvat.")
 
     def refresh(self) -> None:
         for item in self.table.get_children():
@@ -703,25 +1099,29 @@ class ScheduleApp(tk.Tk):
             day_entries = entries_by_day.get(day)
             if not day_entries:
                 continue
-            self.table.insert("", "end", values=(day, "", "", "", ""), tags=("day",))
+            self.table.insert(
+                "", "end",
+                values=(day, "", "", "", "", "", ""),
+                tags=("day",),
+            )
             for (entry_day, entry_interval, entry_group), alternatives in day_entries:
                 alternatives.sort(key=lambda item: (item.week, item.content))
-                content = "  •  ".join(
-                    f"{item.week}: {item.content}" if item.week != WEEK_ALL else item.content
-                    for item in alternatives
-                )
-                self.table.insert(
-                    "", "end",
-                    values=(
-                        "",
-                        entry_interval,
-                        entry_group,
-                        " / ".join(sorted({item.week for item in alternatives})),
-                        content,
-                    ),
-                    tags=("even" if row_index % 2 == 0 else "odd",),
-                )
-                row_index += 1
+                for item in alternatives:
+                    activity = parse_activity(item.content)
+                    self.table.insert(
+                        "", "end",
+                        values=(
+                            "",
+                            entry_interval,
+                            entry_group,
+                            item.week,
+                            activity.subject,
+                            activity.teacher or "—",
+                            activity.room or "—",
+                        ),
+                        tags=("even" if row_index % 2 == 0 else "odd",),
+                    )
+                    row_index += 1
         self.status.configure(text="Orarul este gata.")
 
 

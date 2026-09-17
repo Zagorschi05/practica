@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from app import ScheduleEntry, WEEK_ODD, parse_pdf
+from app import ScheduleEntry, WEEK_ODD, parse_activity, parse_pdf, render_schedule_image
 
 
 PDF_PATH = Path(r"C:\Users\Zagorschi Cristi\Downloads\anul_iii_semestrul_v-7.pdf")
@@ -12,6 +12,41 @@ class ScheduleEntryTests(unittest.TestCase):
         entry = ScheduleEntry("Luni", "08:00-09:30", "TI-241", "Pereche", WEEK_ODD)
 
         self.assertEqual(entry.week, WEEK_ODD)
+
+
+class ActivityParsingTests(unittest.TestCase):
+    def test_course_lab_and_seminar_kinds(self):
+        self.assertEqual(parse_activity("c. MP | Zbancă D. | 6-2").kind, "course")
+        self.assertEqual(parse_activity("lab. BD1 | Bonta E. | 501").kind, "lab")
+        self.assertEqual(parse_activity("SSM | Chiriac M. | 606").kind, "seminar")
+
+    def test_room_is_shortened(self):
+        activity = parse_activity("c. MP | Zbancă D. | Aula 6-2 Henri Coandă")
+        self.assertEqual(activity.room, "Aula 6-2")
+
+    def test_normal_three_part_cell_stays_unchanged(self):
+        activity = parse_activity("BD | Bonta E. | 501")
+        self.assertEqual(activity.subject, "BD")
+        self.assertEqual(activity.teacher, "Bonta E.")
+        self.assertEqual(activity.room, "501")
+
+    def test_wrapped_subject_lines_are_merged(self):
+        activity = parse_activity("PD (octombrie/ | noiembrie) | Leah A. | 708")
+        self.assertEqual(activity.subject, "PD (octombrie/ noiembrie)")
+        self.assertEqual(activity.teacher, "Leah A.")
+        self.assertEqual(activity.room, "708")
+
+    def test_parenthesized_month_fragment_joins_subject(self):
+        activity = parse_activity("lab. SM | (octombire/noiembrie) | Verjbitchi V. | 409")
+        self.assertEqual(activity.subject, "lab. SM (octombire/ noiembrie)")
+        self.assertEqual(activity.teacher, "Verjbitchi V.")
+        self.assertEqual(activity.room, "409")
+
+    def test_two_teachers_keep_room_separate(self):
+        activity = parse_activity("DAS | Postaru A. | Zaica M. | 113")
+        self.assertEqual(activity.subject, "DAS")
+        self.assertEqual(activity.teacher, "Postaru A. / Zaica M.")
+        self.assertEqual(activity.room, "113")
 
 
 @unittest.skipUnless(PDF_PATH.exists(), "PDF-ul de test nu este disponibil")
@@ -76,6 +111,12 @@ class RealPdfTests(unittest.TestCase):
             and entry.content.startswith("PD")
         }
         self.assertEqual(pd_groups, {"TI-242"})
+
+    def test_schedule_image_can_be_rendered_for_a_group(self):
+        entries = parse_pdf(PDF_PATH)
+        image = render_schedule_image(entries, "TI-241")
+        self.assertGreater(image.width, 800)
+        self.assertGreater(image.height, 600)
 
 
 if __name__ == "__main__":
