@@ -26,11 +26,18 @@ TIME_RE = re.compile(r"^\d{1,2}[.:]\d{2}-\d{1,2}[.:]\d{2}$")
 DAY_NAMES = ["Luni", "Marți", "Miercuri", "Joi", "Vineri"]
 
 # The supplied PDF has five horizontal day blocks and seven time rows per block.
-TIME_ROWS = ["08:00-09:30", "09:45-11:15", "11:30-13:00",
-             "13:30-15:00", "15:15-16:45", "17:00-18:30", "18:45-20:15"]
+TIME_ROWS = [
+    "08:00-09:30",
+    "09:45-11:15",
+    "11:30-13:00",
+    "13:30-15:00",
+    "15:15-16:45",
+    "17:00-18:30",
+    "18:45-20:15",
+]
 WEEK_ALL = "Toate"
-WEEK_ODD = "Impar\u0103"
-WEEK_EVEN = "Par\u0103"
+WEEK_ODD = "Impară"
+WEEK_EVEN = "Pară"
 ROOM_ONLY_RE = re.compile(
     r"^(?:(?:Aula|sala|lab\.)\s*)?(?:\d{1,3}(?:-\d{1,3})?|[A-Z]-?\d{1,3})$",
     re.IGNORECASE,
@@ -52,6 +59,29 @@ class ScheduleEntry:
 def _normalise(value: str) -> str:
     value = value.replace("Ș", "S").replace("Ț", "T").replace("ș", "s").replace("ț", "t")
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_query(text: str) -> str:
+    text = text.lower()
+    replacements = {
+        "ă": "a", "â": "a", "î": "i", "ș": "s", "ş": "s", "ț": "t", "ţ": "t",
+        "Ă": "a", "Â": "a", "Î": "i", "Ș": "s", "Ş": "s", "Ț": "t", "Ţ": "t",
+    }
+    for char, rep in replacements.items():
+        text = text.replace(char, rep)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def matches_query(entry: ScheduleEntry, query: str) -> bool:
+    clean_query = _normalize_query(query)
+    if not clean_query:
+        return True
+    activity = parse_activity(entry.content)
+    haystack = _normalize_query(
+        f"{activity.teacher} {activity.subject} {activity.room} {entry.group} {entry.day} {entry.interval}"
+    )
+    tokens = clean_query.split()
+    return all(token in haystack for token in tokens)
 
 
 def _group_columns(words: list[tuple]) -> list[tuple[str, float]]:
@@ -83,6 +113,7 @@ def _split_cell_blocks(words: list[tuple], drawings: list[dict]) -> list[str]:
     ]
     blocks: list[list[str]] = []
     block: list[str] = []
+    last_centre = 0.0
     for centre, values in lines:
         if block and any(previous < separator <= centre for separator in separators for previous in [last_centre]):
             blocks.append(block)
@@ -92,9 +123,9 @@ def _split_cell_blocks(words: list[tuple], drawings: list[dict]) -> list[str]:
     if block:
         blocks.append(block)
     return [
-        _normalise(" | ".join(block))
-        for block in blocks
-        if _normalise(" | ".join(block))
+        _normalise(" | ".join(b))
+        for b in blocks
+        if _normalise(" | ".join(b))
     ]
 
 
@@ -371,7 +402,6 @@ def parse_pdf(path: str | Path) -> list[ScheduleEntry]:
                 min(split_candidates, key=lambda value: abs(value - row_centre))
                 if split_candidates else None
             )
-            blocks: list[tuple[list[tuple], str]]
             if split_y is not None:
                 band_specs = [
                     (row_top, split_y, WEEK_ODD),
@@ -857,7 +887,7 @@ def save_schedule_image(
 class ScheduleApp(ttk.Window):
     def __init__(self) -> None:
         super().__init__(themename=LIGHT_THEME, title="Orar pe grupe")
-        self.geometry("1150x700")
+        self.geometry("1150x720")
         self.minsize(850, 500)
         self.entries: list[ScheduleEntry] = []
         self.dark_mode_var = ttk.BooleanVar(value=False)
@@ -866,6 +896,9 @@ class ScheduleApp(ttk.Window):
     def _configure_fonts(self) -> None:
         colors = self.style.colors
         text_color = "#ffffff" if self.dark_mode_var.get() else "#000000"
+        field_bg = colors.bg
+        border = colors.border
+        primary = colors.primary
         self.style.configure(
             "Title.TLabel",
             font=("Segoe UI", 22, "bold"),
@@ -884,10 +917,78 @@ class ScheduleApp(ttk.Window):
         self.style.configure("Treeview", rowheight=44, font=("Segoe UI", 10))
         self.style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
         self.style.configure("Round.Toggle", foreground=text_color)
+        self.style.configure("TEntry", font=("Segoe UI", 10))
         self.style.map(
             "Round.Toggle",
             foreground=[("selected", text_color), ("!selected", text_color)],
         )
+        for style_name in ("TCombobox", "primary.TCombobox"):
+            self.style.configure(
+                style_name,
+                fieldbackground=field_bg,
+                background=field_bg,
+                foreground=text_color,
+                insertcolor=text_color,
+                bordercolor=border,
+                lightcolor=border,
+                darkcolor=border,
+                arrowcolor=text_color,
+                padding=(10, 7),
+                arrowsize=14,
+            )
+            self.style.map(
+                style_name,
+                fieldbackground=[
+                    ("readonly", field_bg),
+                    ("focus", field_bg),
+                    ("!disabled", field_bg),
+                ],
+                foreground=[
+                    ("readonly", text_color),
+                    ("focus", text_color),
+                    ("!disabled", text_color),
+                ],
+                bordercolor=[("focus", primary), ("!focus", border)],
+                lightcolor=[("focus", primary), ("!focus", border)],
+                darkcolor=[("focus", primary), ("!focus", border)],
+                arrowcolor=[("disabled", colors.secondary), ("!disabled", text_color)],
+                selectbackground=[("readonly", field_bg)],
+                selectforeground=[("readonly", text_color)],
+            )
+        self.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+        self.option_add("*TCombobox*Listbox.background", field_bg)
+        self.option_add("*TCombobox*Listbox.foreground", text_color)
+        self.option_add("*TCombobox*Listbox.selectBackground", primary)
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.borderWidth", 0)
+        self.option_add("*TCombobox*Listbox.relief", "flat")
+
+    def _style_dropdowns(self) -> None:
+        """Style native combobox popups to match the active theme."""
+        if not hasattr(self, "group_box"):
+            return
+        colors = self.style.colors
+        text_color = "#ffffff" if self.dark_mode_var.get() else "#000000"
+        background = colors.bg
+        select_bg = colors.primary
+        for combo in (self.group_box, self.day_box, self.week_box):
+            try:
+                popup = self.tk.call("ttk::combobox::PopdownWindow", str(combo))
+                listbox = f"{popup}.f.l"
+                self.tk.call(
+                    listbox, "configure",
+                    "-background", background,
+                    "-foreground", text_color,
+                    "-selectbackground", select_bg,
+                    "-selectforeground", "#ffffff",
+                    "-font", "Segoe UI 10",
+                    "-borderwidth", 0,
+                    "-highlightthickness", 0,
+                    "-relief", "flat",
+                    "-activestyle", "none",
+                )
+            except Exception:
+                continue
 
     def _apply_row_colors(self) -> None:
         colors = self.style.colors
@@ -901,13 +1002,19 @@ class ScheduleApp(ttk.Window):
         self.style.theme_use(theme)
         self._configure_fonts()
         self._apply_row_colors()
+        self._style_dropdowns()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        if hasattr(self, "search_entry"):
+            self.search_entry.focus_set()
 
     def _build_ui(self) -> None:
         self._configure_fonts()
 
-        header = ttk.Frame(self, padding=(28, 24, 28, 16))
+        header = ttk.Frame(self, padding=(28, 20, 28, 14))
         header.pack(fill=X)
-        card = ttk.Frame(header, padding=(24, 22, 24, 20))
+        card = ttk.Frame(header, padding=(24, 20, 24, 18))
         card.pack(fill=X)
         title_row = ttk.Frame(card)
         title_row.pack(fill=X)
@@ -923,52 +1030,70 @@ class ScheduleApp(ttk.Window):
             card,
             text="Deschide PDF-ul real și afișează activitățile organizate automat pe grupe.",
             style="Body.TLabel",
-        ).pack(anchor=W, pady=(4, 18))
+        ).pack(anchor=W, pady=(4, 14))
 
-        controls = ttk.Frame(card)
-        controls.pack(fill=X)
+        controls_top = ttk.Frame(card)
+        controls_top.pack(fill=X, pady=(0, 10))
         ttk.Button(
-            controls, text="Deschide PDF", command=self.open_pdf, bootstyle="primary",
+            controls_top, text="Deschide PDF", command=self.open_pdf, bootstyle="primary",
         ).pack(side=LEFT)
         ttk.Button(
-            controls, text="Salvează imagine", command=self.save_image, bootstyle="success",
+            controls_top, text="Salvează imagine", command=self.save_image, bootstyle="success",
         ).pack(side=LEFT, padx=(10, 0))
         self.file_label = ttk.Label(
-            controls, text="Niciun fișier selectat", style="Body.TLabel",
+            controls_top, text="Niciun fișier selectat", style="Body.TLabel",
         )
-        self.file_label.pack(side=LEFT, padx=(14, 20))
+        self.file_label.pack(side=LEFT, padx=(14, 0))
 
-        ttk.Label(controls, text="GRUPĂ", style="Field.TLabel").pack(side=LEFT, padx=(0, 6))
+        controls_filters = ttk.Frame(card)
+        controls_filters.pack(fill=X)
+
+        ttk.Label(controls_filters, text="GRUPĂ", style="Field.TLabel").pack(side=LEFT, padx=(0, 6))
         self.group_var = ttk.StringVar(value="Toate")
         self.group_box = ttk.Combobox(
-            controls, textvariable=self.group_var, state="readonly",
-            width=14, bootstyle="primary",
+            controls_filters, textvariable=self.group_var, state="readonly",
+            width=12, bootstyle="primary", postcommand=self._style_dropdowns,
         )
         self.group_box["values"] = ("Toate",)
         self.group_box.pack(side=LEFT)
         self.group_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
 
-        ttk.Label(controls, text="ZI", style="Field.TLabel").pack(side=LEFT, padx=(18, 6))
+        ttk.Label(controls_filters, text="ZI", style="Field.TLabel").pack(side=LEFT, padx=(16, 6))
         self.day_var = ttk.StringVar(value="Toate")
         self.day_box = ttk.Combobox(
-            controls, textvariable=self.day_var, state="readonly",
-            width=12, bootstyle="primary",
+            controls_filters, textvariable=self.day_var, state="readonly",
+            width=10, bootstyle="primary", postcommand=self._style_dropdowns,
         )
         self.day_box["values"] = ("Toate", *DAY_NAMES)
         self.day_box.pack(side=LEFT)
         self.day_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
 
-        ttk.Label(controls, text="SĂPTĂMÂNĂ", style="Field.TLabel").pack(
-            side=LEFT, padx=(18, 6),
+        ttk.Label(controls_filters, text="SĂPTĂMÂNĂ", style="Field.TLabel").pack(
+            side=LEFT, padx=(16, 6),
         )
         self.week_var = ttk.StringVar(value=WEEK_ALL)
         self.week_box = ttk.Combobox(
-            controls, textvariable=self.week_var, state="readonly",
-            width=10, bootstyle="primary",
+            controls_filters, textvariable=self.week_var, state="readonly",
+            width=10, bootstyle="primary", postcommand=self._style_dropdowns,
         )
         self.week_box["values"] = (WEEK_ALL, WEEK_ODD, WEEK_EVEN)
         self.week_box.pack(side=LEFT)
         self.week_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
+
+        ttk.Label(controls_filters, text="PROFESOR / CĂUTARE", style="Field.TLabel").pack(
+            side=LEFT, padx=(16, 6),
+        )
+        self.search_var = ttk.StringVar(value="")
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        self.search_entry = ttk.Entry(
+            controls_filters, textvariable=self.search_var, width=18, bootstyle="primary",
+        )
+        self.search_entry.pack(side=LEFT)
+        self.clear_btn = ttk.Button(
+            controls_filters, text="✕", width=2, bootstyle="secondary-outline",
+            command=self._clear_search,
+        )
+        self.clear_btn.pack(side=LEFT, padx=(4, 0))
 
         table_frame = ttk.Frame(self, padding=(28, 0, 28, 12))
         table_frame.pack(fill=BOTH, expand=True)
@@ -1010,6 +1135,7 @@ class ScheduleApp(ttk.Window):
             style="Body.TLabel", padding=(28, 0, 28, 18),
         )
         self.status.pack(anchor=W)
+        self._style_dropdowns()
 
     def open_pdf(self) -> None:
         path = filedialog.askopenfilename(
@@ -1029,6 +1155,7 @@ class ScheduleApp(ttk.Window):
         self.group_var.set("Toate")
         self.day_var.set("Toate")
         self.week_var.set("Toate")
+        self.search_var.set("")
         self.refresh()
 
     def save_image(self) -> None:
@@ -1069,11 +1196,13 @@ class ScheduleApp(ttk.Window):
         group = self.group_var.get()
         day = self.day_var.get()
         week = self.week_var.get()
+        query = self.search_var.get().strip()
         filtered = [
             entry for entry in self.entries
             if (group == "Toate" or entry.group == group)
             and (day == "Toate" or entry.day == day)
             and (week == "Toate" or entry.week in (week, "Toate"))
+            and matches_query(entry, query)
         ]
         day_order = {name: index for index, name in enumerate(DAY_NAMES)}
         time_order = {value: index for index, value in enumerate(TIME_ROWS)}
@@ -1095,13 +1224,13 @@ class ScheduleApp(ttk.Window):
             entries_by_day.setdefault(key[0], []).append((key, alternatives))
 
         row_index = 0
-        for day in DAY_NAMES:
-            day_entries = entries_by_day.get(day)
+        for day_name in DAY_NAMES:
+            day_entries = entries_by_day.get(day_name)
             if not day_entries:
                 continue
             self.table.insert(
                 "", "end",
-                values=(day, "", "", "", "", "", ""),
+                values=(day_name, "", "", "", "", "", ""),
                 tags=("day",),
             )
             for (entry_day, entry_interval, entry_group), alternatives in day_entries:
@@ -1122,7 +1251,13 @@ class ScheduleApp(ttk.Window):
                         tags=("even" if row_index % 2 == 0 else "odd",),
                     )
                     row_index += 1
-        self.status.configure(text="Orarul este gata.")
+
+        if not self.entries:
+            self.status.configure(text="Selectează un PDF pentru a vedea orarul.")
+        elif query:
+            self.status.configure(text=f"Găsite {row_index} activități pentru căutarea '{query}'.")
+        else:
+            self.status.configure(text=f"Orarul este gata ({row_index} activități afișate).")
 
 
 if __name__ == "__main__":

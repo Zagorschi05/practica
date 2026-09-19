@@ -1,7 +1,14 @@
 import unittest
 from pathlib import Path
 
-from app import ScheduleEntry, WEEK_ODD, parse_activity, parse_pdf, render_schedule_image
+from app import (
+    ScheduleEntry,
+    WEEK_ODD,
+    matches_query,
+    parse_activity,
+    parse_pdf,
+    render_schedule_image,
+)
 
 
 PDF_PATH = Path(r"C:\Users\Zagorschi Cristi\Downloads\anul_iii_semestrul_v-7.pdf")
@@ -47,6 +54,27 @@ class ActivityParsingTests(unittest.TestCase):
         self.assertEqual(activity.subject, "DAS")
         self.assertEqual(activity.teacher, "Postaru A. / Zaica M.")
         self.assertEqual(activity.room, "113")
+
+
+class SearchFilterTests(unittest.TestCase):
+    def test_empty_query_matches_all(self):
+        entry = ScheduleEntry("Luni", "08:00-09:30", "TI-241", "c. MP | Zbancă D. | 6-2")
+        self.assertTrue(matches_query(entry, ""))
+        self.assertTrue(matches_query(entry, "   "))
+
+    def test_search_by_teacher_without_diacritics(self):
+        entry = ScheduleEntry("Luni", "08:00-09:30", "TI-241", "c. MP | Zbancă D. | 6-2")
+        self.assertTrue(matches_query(entry, "zbanca"))
+        self.assertTrue(matches_query(entry, "Zbancă"))
+        self.assertTrue(matches_query(entry, "zbanca d."))
+        self.assertFalse(matches_query(entry, "Popescu"))
+
+    def test_search_by_subject_and_room(self):
+        entry = ScheduleEntry("Marți", "11:30-13:00", "TI-242", "lab. BD1 | Bonta E. | 501")
+        self.assertTrue(matches_query(entry, "bonta"))
+        self.assertTrue(matches_query(entry, "bd1"))
+        self.assertTrue(matches_query(entry, "501"))
+        self.assertTrue(matches_query(entry, "bonta 501"))
 
 
 @unittest.skipUnless(PDF_PATH.exists(), "PDF-ul de test nu este disponibil")
